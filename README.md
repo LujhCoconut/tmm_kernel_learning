@@ -1,4 +1,4 @@
-# Tiered Mememory System: Kernel Code Study Notes
+# Tiered Mememory Management: Kernel Code Study Notes
 
 The source code planned for analysis and study in this repository includes the following:
 ```
