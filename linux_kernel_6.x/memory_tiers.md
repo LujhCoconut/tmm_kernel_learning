@@ -38,11 +38,11 @@ struct memory_dev_type {
       ```c
       // 层级结构示意
         struct memory_tier {
-            struct list_head memory_types;  // 头节点
+            struct list_head memory_types;  // Head node, 头节点
             ...
         };
         struct memory_dev_type {
-            struct list_head tier_sibling;  // 成员节点
+            struct list_head tier_sibling;  // member nodes, 成员节点
             ...
         };
       ```
@@ -57,8 +57,79 @@ struct memory_dev_type {
             * Separation of data and operations
                 > 数据与操作分离
 
-                list_head only contains prev and next pointers (occupying 16 bytes) and does not store any application-specific data.
-                > `list_head` 仅包含 prev/next 指针（占 16 字节），不存储业务数据;
+                * list_head only contains prev and next pointers (occupying 16 bytes) and does not store any application-specific data.
+                  > `list_head` 仅包含 prev/next 指针（占 16 字节），不存储业务数据;
 
-                The host structure (e.g., `memory_dev_type`) gains linked list capability by embedding a list_head member (e.g., `tier_sibling`), enabling zero-copy linkage.
-                > 宿主结构（如 `memory_dev_type`）通过嵌入 `list_head` 成员（`tier_sibling`）获得链表能力，实现​​零拷贝链接​​。
+                * The host structure (e.g., `memory_dev_type`) gains linked list capability by embedding a list_head member (e.g., `tier_sibling`), enabling zero-copy linkage.
+                  > 宿主结构（如 `memory_dev_type`）通过嵌入 `list_head` 成员（`tier_sibling`）获得链表能力，实现​​零拷贝链接​​。
+
+                    ```c
+                    // 内存类型加入层级链表
+                    list_add_tail(&new_type->tier_sibling, &memtier->memory_types);
+                    ```
+            * Type-agnostic operation interface
+                > 类型无关的操作接口
+
+                * All linked list operations (insertion, deletion, modification, and lookup) are implemented via generic functions such as `list_add()` and `list_del()`.
+
+                  > 所有链表操作（增删改查）通过通用函数实现（如 `list_add()`、`list_del()`）
+
+                * Avoid rewriting linked list logic for each data type.
+                  > 避免为每种数据类型重写链表逻辑
+            
+            * Reverse mapping to the host object
+                > 宿主对象反向定位
+
+                * Using the `container_of` macro to reverse-calculate the host structure’s address from a `list_head` pointer.
+                  > 通过 `container_of` 宏从 `list_head` 指针反向计算宿主结构地址 
+
+                  ```c
+                  struct memory_dev_type *memtype = container_of(ptr, struct memory_dev_type, tier_sibling);
+                  ```
+      * **More** about `Linux Memory Management`:
+        > Memory management mechanisms: the collaboration between the buddy system and the slab allocator   
+        内存管理机制：伙伴系统与 Slab 分配器的协同​
+
+        * Memory allocation for the host structure 宿主结构的内存分配​   
+            * Large memory blocks (`≥ PAGE_SIZE`) are allocated as contiguous physical pages using the buddy system.
+            
+                ```c
+                // 为 memory_dev_type 分配大内存（假设其大小 >4KB）
+                struct memory_dev_type *memtype = (struct memory_dev_type*)__get_free_pages(GFP_KERNEL, order);
+                ```
+            * Small memory allocations (`< PAGE_SIZE`) use the slab allocator to cache objects.
+            
+                ```c
+                struct memory_dev_type *memtype = kmalloc(sizeof(struct memory_dev_type), GFP_KERNEL);
+                ```
+              Slab 将伙伴系统分配的页框分割为小对象缓存（如 memory_dev_type），显著减少碎片
+
+        * Memory of the linked list node itself   链表节点自身的内存
+            * **Zero overhead**: Since `list_head` is a member of the host structure, its memory is allocated along with the host and requires no separate management.
+                > ​​**零开销​**​：`list_head` 作为宿主结构的成员，其内存已随宿主分配，无需单独管理
+            * **Allocation-free operations**: Functions like `list_add()` and `list_del()` only manipulate pointers without triggering memory allocation or deallocation.
+                > **操作无分配​​**：`list_add()`、`list_del()` 等函数仅修改指针，不触发内存分配/释放
+
+
+            ```
+            |  CPU Core  |        Buddy System          |        Slab Allocator         |   Link Operation   |
+            |____________|______________________________|_______________________________|____________________|
+            |            |                              |                               |                    |
+            | 2^{order}  |                              |                               |                    |
+            | ---------> |                              |                               |                    |
+            | seq_pages  |                              |                               |                    |
+            | <--------- |                              |                               |                    |
+            |            |                              |                               |                    |
+            | Splitting large pages into slab objects   |                               |                    |
+            | ----------------------------------------> |                               |                    |
+            | <---------------------------------------- |                               |                    |
+            |            |                              |                               |                    |
+            |                             list_add_tail() ...                           |                    |
+            | ------------------------------------------------------------------------> |          |         |
+            |                                                                           |          |         |
+            |                                                                           |  update prev/next  |
+            |            |                              |                               |                    |
+            |____________|______________________________|_______________________________|____________________|
+            |  CPU Core  |        Buddy System          |        Slab Allocator         |   Link Operation   |
+            ```
+
