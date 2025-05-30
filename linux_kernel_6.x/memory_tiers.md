@@ -320,3 +320,165 @@ struct memory_tier {
     * `dev`: 一个设备结构体，用于在sysfs中表示该层级，这样用户空间就可以通过sysfs查看层级信息。
     * `lower_tier_mask`: 一个节点掩码（nodemask），表示所有比当前层级更低（性能更差）的层级中包含的节点。这个掩码用于在页面降级（demotion）时作为备选目标。
     
+
+
+
+# Example
+
+See `tierinit.c`   (`@author` Midhul Vuppalapati @ Cornell University )
+
+This file emulates different memory tiers using NUMA.
+
+## How to define memory-tiers
+```c
+#define MEMTIER_DEFAULT_FARMEM_ADISTANCE	(MEMTIER_ADISTANCE_DRAM * 10)
+#define FARMEM_NUMA 0
+#define LOCAL_NUMA 1
+```
+
+```c
+static int tierinit_init(void)
+{
+   ...
+    
+    farmem_type = alloc_memory_type(MEMTIER_DEFAULT_FARMEM_ADISTANCE);
+    if(IS_ERR(farmem_type)) {
+        pr_info("Error creating memory type");
+        return -1;
+    }
+
+   ...
+}
+```
+
+## How to init memory-tiers
+```c
+static int tierinit_init(void)
+{
+    ...
+    // Clear the memory tier binding of a node: (1) Call clear_node_memory_tier() (2) Rebuild the demotion path
+    // 清除节点内存层级绑定：（1）调用 clear_node_memory_tier() （2）重建降级路径
+    colloid_clear_memory_tier(FARMEM_NUMA);
+    pr_info("cleared NUMA node from memory tier");
+
+    //  Remove the FARMEM_NUMA node from the default DRAM memory type
+    //  将 FARMEM_NUMA 节点从默认DRAM内存类型中清除
+    clear_node_memory_type(FARMEM_NUMA, colloid_get_default_dram_memtype());
+    pr_info("cleared NUMA node from default DRAM mem type");
+
+    // Unbind the node from the default DRAM
+    // 解除节点与默认DRAM的绑定
+    init_node_memory_type(FARMEM_NUMA, farmem_type);
+    pr_info("init numa node to farmem type");
+
+    // Initialize the memory tier of a node: (1) Check the CPU status (2) Call set_node_memory_tier()
+    // 初始化节点内存层级： （1） 检查 CPU 状态  （2）调用 set_node_memory_tier()
+    colloid_init_memory_tier(FARMEM_NUMA);
+    pr_info("init numa node to new memory tier");
+
+    // Verify the configuration
+    // 验证配置结果
+    pr_info("next_demotion_node[%d]=%d", LOCAL_NUMA, next_demotion_node(LOCAL_NUMA));
+    if(node_is_toptier(FARMEM_NUMA)) {
+        pr_info("farmem node is top tier :(");
+    } else {
+        pr_info("farmem node is not top tier :)");
+    }
+    pr_info("Done :)");
+    
+    return 0;
+}
+```
+
+* Related source code
+
+    ```c
+    /**
+     * @return true 表示成功解除绑定，false 表示节点无效或未绑定层级
+     */
+    static bool clear_node_memory_tier(int node)
+    ```
+    ```c
+    static bool clear_node_memory_tier(int node)
+    {
+        bool cleared = false;
+        pg_data_t *pgdat;
+        struct memory_tier *memtier;
+        // 节点有效性检查
+        pgdat = NODE_DATA(node);
+        if (!pgdat)
+            return false;
+
+        /*
+        * Make sure that anybody looking at NODE_DATA who finds
+        * a valid memtier finds memory_dev_types with nodes still
+        * linked to the memtier. We achieve this by waiting for
+        * rcu read section to finish using synchronize_rcu.
+        * This also enables us to free the destroyed memory tier
+        * with kfree instead of kfree_rcu
+        */ // RCU 同步保护
+        memtier = __node_get_memory_tier(node);
+        if (memtier) {
+            struct memory_dev_type *memtype;
+
+            rcu_assign_pointer(pgdat->memtier, NULL);
+            synchronize_rcu();
+            // 清理内存类型关联​
+            // node_memory_types[]​​：全局数组，记录节点与内存类型（memory_dev_type）的映射
+            // ​​node_clear()​​：从内存类型的节点位图中移除当前节点
+            memtype = node_memory_types[node].memtype;
+            node_clear(node, memtype->nodes);
+            // 层级销毁条件判断
+            if (nodes_empty(memtype->nodes)) {
+                list_del_init(&memtype->tier_sibling);
+                if (list_empty(&memtier->memory_types))
+                    destroy_memory_tier(memtier);
+            }
+            cleared = true;
+        }
+        // 返回操作结果
+        return cleared;
+    }
+    ```
+    * Therefore, a typical call flow can be summarized as follows.
+    
+        因此可以总结出一个典型的调用流程
+        
+        ```c
+        // 示例：动态重配内存层级
+        void reconfigure_tier(int node) 
+        {
+            clear_node_memory_tier(node);
+            clear_node_memory_type(FARMEM_NUMA, get_default_dram_memtype());
+            init_node_memory_type(FARMEM_NUMA, farmem_type);
+            set_node_memory_tier(node);
+        }
+        ```
+## How to exit (Module Exit)
+```c
+static void tierinit_exit(void)
+{
+    // Reset to normal DRAM mem type
+    colloid_clear_memory_tier(FARMEM_NUMA);
+    pr_info("cleared NUMA node from new memory tier");
+    clear_node_memory_type(FARMEM_NUMA, farmem_type);
+    pr_info("cleared NUMA node from farmem type");
+    // NOTE: We should not call init_node_memory_type for default dram memtype
+    // since it is already called internally in set_node_memory_tier
+    // If we do, map_count will be spuriously double incremented
+    //init_node_memory_type(FARMEM_NUMA, colloid_get_default_dram_memtype());
+    //pr_info("init numa node to default dram mem type");
+    colloid_init_memory_tier(FARMEM_NUMA);
+    pr_info("init numa node to original memory tier");
+
+    pr_info("next_demotion_node[%d]=%d", LOCAL_NUMA, next_demotion_node(LOCAL_NUMA));
+    if(node_is_toptier(FARMEM_NUMA)) {
+        pr_info("farmem node is top tier :)");
+    } else {
+        pr_info("farmem node is not top tier :(");
+    }
+
+    destroy_memory_type(farmem_type);
+    pr_info("tierinit exit");
+}
+```
